@@ -1,4 +1,4 @@
-#coding = utf-8
+# -*- coding:utf-8 -*- 
 import word2vec
 #model = word2vec.load('/media/ltp/625C80425C8012C9/word2vec/cn.cbow.bin')
 #model = word2vec.WordVectors.from_binary('/media/ltp/625C80425C8012C9/word2vec/cn.cbow.bin',200)

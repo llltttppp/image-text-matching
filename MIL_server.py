@@ -41,7 +41,7 @@ class BidirectionNet:
         self.endpoint['image_fc1'] = image_fc1
         self.endpoint['image_fc2'] = image_fc2
         self.endpoint['prob'] = prob
-        return prob       
+        return prob
     def mil_loss(self,prob,labels,elips=1e-4):        
         cross_entropy = -tf.reduce_mean(labels*tf.log(prob+elips) + (1-labels)*tf.log(1-prob+elips))
         return cross_entropy
@@ -69,15 +69,17 @@ class BidirectionNet:
         for watch_scope in watch_list:
             watch_var = [var for var in t_var if watch_scope+'/weights' in var.name]
             tf.summary.histogram('weights/'+watch_scope, watch_var[0])
-    def build_trainop(self,loss,lr=0.001,clipping_norm=10,optimizer =tf.train.AdadeltaOptimizer,tvars=None):
+    def build_trainop(self,loss,lr=0.001,clipping_norm=10,optimizer =tf.train.AdadeltaOptimizer,tvars=None,clip_vars=None):
         if tvars is None:        
             tvars = tf.trainable_variables()
+        if clip_vars is None:
+            clip_vars = tvars
         g=tf.gradients(loss, tvars)
-        grads= [tf.clip_by_value(v, -clipping_norm,clipping_norm) for v in g ]
+        grads= [tf.clip_by_global_norm(v,clipping_norm) if v in clip_vars else v for v in g ]
         opt = optimizer(lr)
         for i,v in enumerate(tvars):
             tf.summary.histogram(name=v.name+'_gradient', values=grads[i])
-        return opt.apply_gradients(zip(grads,tvars))    
+        return opt.apply_gradients(zip(grads,tvars))   
     def positive_loss(self, x, y):
         return tf.reduce_sum(tf.squared_difference(x, y, name='positive_loss'))        
     def top_K_loss(self,sentence,image,K=30,margin=0.3):
@@ -112,11 +114,12 @@ class BidirectionNet:
         model_save_path='./model/mil/'
         make_if_not_exist(model_save_path)
         model_save_path += 'model'        
-        sentence = np.array([v.strip() for v in open('./train_txt/train.txt').readlines()])
-        data_root = '/media/ltp/40BC89ECBC89DD32/souhu_fusai/'
+    
+        data_root = '../souhu_data/fusai/'
+        sentence = np.array([v.strip() for v in open(data_root+'train_txt/train.txt').readlines()])
+        
         img_feat_file = data_root + 'train_img_feat_3crop_notAvg.h5'
         print 'image feature read from %s' %img_feat_file	
-
         dataset_size = 249900        
         img_h5 = h5py.File(img_feat_file, 'r')
         nDataset = len(img_h5.keys())

@@ -28,9 +28,7 @@ class BidirectionNet:
             self.build_summary()
     def build_input(self):
         # positive
-        self.vector_size=300
-        self.sentence_len =105
-        self.raw_sentence= tf.placeholder(tf.float32, shape=[self.batch_size,self.sentence_len,self.vector_size],name='raw_sentence')
+        self.raw_sentence= tf.placeholder(tf.float32, shape=[self.batch_size,18000],name='raw_sentence')
         self.sentence_emb =self.raw_sentence #tf.nn.embedding_lookup(tf.get_variable('word_embedding',[4096,512]),self.raw_sentence)
         self.image_feat = tf.placeholder(tf.float32,shape=[self.batch_size,4096], name='image_features')   
     def conv_layer(self, X, num_output, kernel_size, s, p='SAME'):
@@ -40,20 +38,11 @@ class BidirectionNet:
     def sentencenet(self, sentence_emb, reuse=False):
         with tf.variable_scope('sentence_net', reuse=reuse) as scope:
             wd = tf.contrib.layers.l2_regularizer(self.weight_decay)
-            lstm_cell = tf.contrib.rnn.BasicLSTMCell(num_units=300)
-            lstm_cell = tf.contrib.rnn.DropoutWrapper(lstm_cell,input_keep_prob=self.keep_prob,output_keep_prob=self.keep_prob)
-            zero_state = lstm_cell.zero_state(
-                batch_size=self.sentence_emb.get_shape()[0], dtype=tf.float32)
-                        
-            input_list = tf.unstack(self.sentence_emb,axis=1)
-            output,_ = tf.contrib.rnn.static_rnn(lstm_cell, inputs=input_list,initial_state=zero_state)
-            lstm_output = tf.concat(output[:100:1],axis=1)
-            sentence_fc1 =tf.contrib.layers.fully_connected(lstm_output,2048, \
+            sentence_fc1 =tf.contrib.layers.fully_connected(self.raw_sentence,2048, \
                                                             weights_regularizer=wd, scope='s_fc1') # 20*10*256
             sentence_fc2 = tf.contrib.layers.fully_connected(sentence_fc1, 512,activation_fn=None,normalizer_fn=tf.contrib.layers.batch_norm,\
                                                              normalizer_params={'is_training':self.is_training,'updates_collections':None}, weights_regularizer=wd, scope='s_fc2')
             sentence_fc2 = sentence_fc2/tf.norm(sentence_fc2,axis= -1,keep_dims=True)
-        self.endpoint['sentence_lstm'] = lstm_output
         self.endpoint['sentence_fc1'] = sentence_fc1
         self.endpoint['sentence_fc2'] = sentence_fc2
         return sentence_fc2
@@ -150,13 +139,14 @@ class BidirectionNet:
         return opt.apply_gradients(zip(grads,tvars))   
 
     def train(self, sess, maxEpoch=300, lr=0.0001,is_load=False,ckpt_path=''):
-        logdir = './log/run_Bidirectionnet_lstm/fc6000'
+        logdir = './log/run_Bidirectionnet_GMM/'
         model_save_path='./model/Bidirectionnet_lstm/'
         make_if_not_exist(model_save_path)
         model_save_path+='model'
-        sentence = np.array(open('./train_txt/train_cont.txt','r').readlines())
-        h5file = h5py.File('./train_img_feat_3crop_norm1.h5', mode='r')
-        image_feat_all = np.array(h5file['feature'])
+        data_root = '/media/ltp/40BC89ECBC89DD32/souhu_fusai/'
+        sentence = h5py.File(data_root+'train_sentence_fishervectors.h5',mode='r')
+        h5file = h5py.File(data_root+'train_img_feat_3crop_mean_all.h5', mode='r')
+        image_feat_all = h5file['feature']
         train_op =self.build_trainop(self.total_loss,lr=lr,clipping_norm=100000)
 
         summary_writer = tf.summary.FileWriter(logdir, sess.graph)
@@ -196,19 +186,25 @@ class BidirectionNet:
                 step += 1
 
     def train_multidataset(self, sess, maxEpoch=300, lr=0.0001,is_load=False,ckpt_path='',only_image = False):
-        logdir = './log/Bidirectionnet_lstm/mutidataset/fc30000/'
+        logdir = './log/Bidirectionnet_GMM/GMM1/'
         print 'log in %s' %logdir
-        model_save_path = './model/Bidirectionnet_lstm_mutidataset/fc30000/'
+        model_save_path = './model/GMM/GMM1/'
         make_if_not_exist(model_save_path)
         model_save_path += 'model'
         data_root = '/media/ltp/40BC89ECBC89DD32/souhu_fusai/'
-        img_feat_file = data_root + 'train_img_feat_3crop_mean.h5'
-        dataset_size = 249900
-        sentence=np.array(open('./train_txt/train_cont.txt','r').readlines())
+        img_feat_file = data_root + 'train_img_feat_3crop_mean_all.h5'
+        
+        sentence_feat_file =data_root+'train_sentence_fishervectors.h5'
     
-        print 'image feature read from %s' %img_feat_file	
+        print 'image feature read from %s' %img_feat_file
+        print 'sentence feature read from %s' %sentence_feat_file
         img_h5 = h5py.File(img_feat_file, 'r')
-        nDataset = len(img_h5.keys())
+        sen_h5 = h5py.File(sentence_feat_file, 'r')
+        L_im = img_h5['feature'].shape[0]
+        L_sen = sen_h5['feature'].shape[0]
+        assert L_im == L_sen
+        nDataset = 6
+        dataset_size = int(L_im/nDataset)        
         step = 0
         train_op =self.build_trainop(self.total_loss,lr=lr,clipping_norm=500)
         summary_writer = tf.summary.FileWriter(logdir, sess.graph)
@@ -224,10 +220,16 @@ class BidirectionNet:
         for epoch in range(maxEpoch):
             for setId in np.random.permutation(nDataset):
                 shift = setId * dataset_size
-                img_feat_all = img_h5['feature_'+str(setId)][:,:]
-                N = img_feat_all.shape[0]
+                
                 if setId < nDataset - 1:
+                    img_feat_all = img_h5['feature'][shift:shift+dataset_size,:]
+                    raw_sentence = sen_h5['feature'][shift:shift+dataset_size,:]
+                    N = img_feat_all.shape[0]                    
                     assert N == dataset_size
+                else:
+                    img_feat_all = img_h5['feature'][shift:,:]
+                    raw_sentence = sen_h5['feature'][shift:,:]
+                    N = img_feat_all.shape[0] 
                 for _ in range(2):
                     idxArr = np.random.permutation(N)
                     batch_idx = int(N / self.batch_size)
@@ -333,7 +335,7 @@ if __name__ == '__main__':
         if is_train:
             model = BidirectionNet(is_training=True,is_skip=False,is_TopKloss =True,batch_size=2000,is_keep_prob=False)
             #model.train(sess,lr=0.0001,is_load=True,ckpt_path='./model/Bidirectionnet_lstm/model-1500')
-            model.train_multidataset(sess,lr=0.00001,is_load=True,ckpt_path='./model/Bidirectionnet_lstm/fc30000/model-9000')
+            model.train_multidataset(sess,lr=0.001,is_load=True,ckpt_path='./model/Bidirectionnet_lstm/fc6000/model-2000')
             #model.train(sess,lr=0.0001)
         else:
             model = BidirectionNet(is_training=True,is_skip=False,is_TopKloss =True,batch_size=149,is_keep_prob=False)
