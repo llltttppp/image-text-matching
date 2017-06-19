@@ -13,15 +13,15 @@ def make_if_not_exist(path):
         os.makedirs(path)
         print 'folder %s created' %path
 class BidirectionNet:
-    def __init__(self,is_training=True,is_skip=False,is_TopKloss=True,word2vec_model='./model/word2vec/ourword2vec.pkl',batch_size=500,is_keep_prob=False):
-        self.word2vec = pkl.load(open(word2vec_model,'r'))
+    def __init__(self,is_training=True,is_skip=False,is_TopKloss=True,word2vec_model='./model/word2vec/word2vec_11w.pkl',batch_size=500,is_keep_prob=False):
+        #self.word2vec = pkl.load(open(word2vec_model,'r'))
         self.batch_size = batch_size
         self.weight_decay = 0.0005
         self.endpoint={}
         self.is_skip=is_skip
         self.is_TopKloss = is_TopKloss
         self.is_training = is_training
-        self.keep_prob = 0.8 if is_keep_prob else 1.0
+        self.keep_prob = 0.5 if is_keep_prob else 1.0
         self.build_input()
         self.build_matchnet()
         if is_training:
@@ -38,11 +38,11 @@ class BidirectionNet:
     def sentencenet(self, sentence_emb, reuse=False):
         with tf.variable_scope('sentence_net', reuse=reuse) as scope:
             wd = tf.contrib.layers.l2_regularizer(self.weight_decay)
-            sentence_fc1 =tf.nn.dropout(tf.contrib.layers.fully_connected(sentence_emb,2048, \
-                                                            weights_regularizer=wd, scope='s_fc1'),keep_prob=self.keep_prob )# 20*10*256
+            sentence_fc1 =tf.contrib.layers.fully_connected(sentence_emb,2048, \
+                                                            weights_regularizer=wd, scope='s_fc1') # 20*10*256
             sentence_fc2 = tf.contrib.layers.fully_connected(sentence_fc1, 512,activation_fn=None,normalizer_fn=tf.contrib.layers.batch_norm,\
                                                              normalizer_params={'is_training':self.is_training,'updates_collections':None}, weights_regularizer=wd, scope='s_fc2')
-            sentence_fc2 = sentence_fc2/tf.norm(sentence_fc2,axis= -1,keep_dims=True)
+            sentence_fc2 = tf.nn.softmax(sentence_fc2)
         self.endpoint['sentence_fc1'] = sentence_fc1
         self.endpoint['sentence_fc2'] = sentence_fc2
         return sentence_fc2
@@ -51,13 +51,13 @@ class BidirectionNet:
             return image_feat
         with tf.variable_scope('image_net', reuse=reuse) as scope:
             wd = tf.contrib.layers.l2_regularizer(self.weight_decay)
-            image_fc1 = tf.nn.dropout(tf.contrib.layers.fully_connected(image_feat,2048, weights_regularizer=wd,scope='i_fc1'),keep_prob=self.keep_prob)
+            image_fc1 = tf.contrib.layers.fully_connected(image_feat,2048, weights_regularizer=wd,scope='i_fc1')
             #drop_fc1 = tf.nn.dropout(image_fc1, self.keep_prob, name='drop_fc1')
             image_fc2 = tf.contrib.layers.fully_connected(image_fc1, 512, activation_fn=None, weights_regularizer=wd, scope='i_fc2')
             image_fc2_bn = tf.contrib.layers.batch_norm(image_fc2, center=True, scale=True, is_training=self.is_training, 
                                                         reuse=reuse, decay=0.999, updates_collections=None, 
                                                         scope='i_fc2_bn')
-            embed = image_fc2_bn / tf.norm(image_fc2_bn,axis=-1,keep_dims=True)
+            embed =tf.nn.softmax( image_fc2_bn )
         self.endpoint['image_fc1'] = image_fc1
         self.endpoint['image_fc2'] = embed
         return embed        
@@ -73,15 +73,16 @@ class BidirectionNet:
         # compute loss
         if self.is_training:
             self.reg_loss = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-            self.positiveloss=self.positive_loss(self.sentence_fc2,self.image_fc2)
+            self.positiveloss,self.sparse_loss=self.positive_loss(self.sentence_fc2,self.image_fc2)
             if not self.is_TopKloss:
-                self.total_loss=tf.add_n([self.positive_loss(self.sentence_fc2,self.image_fc2)]+self.reg_loss)
+                self.total_loss=tf.add_n(list(self.positive_loss(self.sentence_fc2,self.image_fc2))+self.reg_loss)
             else:            
-                self.total_loss =tf.add_n( list(self.top_K_loss(self.sentence_fc2,self.image_fc2))+self.reg_loss)
-            self.saver = tf.train.Saver(max_to_keep=20)
+                self.total_loss =tf.add_n(list(self.top_K_loss(self.sentence_fc2,self.image_fc2))+self.reg_loss)
+            self.saver = tf.train.Saver(max_to_keep=50)
     def build_summary(self):
         tf.summary.scalar('loss/reg_loss', tf.add_n(self.reg_loss))
         tf.summary.scalar('loss/positive_loss', self.positiveloss)
+        tf.summary.scalar('loss/sparse_loss',self.sparse_loss)
         tf.summary.scalar('loss/total_loss', self.total_loss)
         if self.is_skip:
             tf.summary.histogram('activation/image_fc2',self.image_fc2)
@@ -98,10 +99,14 @@ class BidirectionNet:
         for watch_scope in watch_list:
             watch_var = [var for var in t_var if watch_scope+'/weights' in var.name]
             tf.summary.histogram('weights/'+watch_scope, watch_var[0])
-    def positive_loss(self, sentence, image):
-        diff = tf.reduce_sum(tf.squared_difference(sentence, image, name='positive_loss')) 
-        return diff     
-    def top_K_loss(self,sentence,image,K=50,margin=0.1):
+    def positive_loss(self, sentence, image,pwieght=1):
+        diff =-tf.log(image)
+        sentence_top,s_idx =tf.nn.top_k(sentence, k=1,  sorted=False)
+        image_top,im_idx = tf.nn.top_k(image, k=1, sorted=False)
+        diff_top=tf.gather_nd(diff, indices=tf.concat([tf.expand_dims(tf.range(self.batch_size),axis=1),s_idx],axis=1))
+        sparse_loss =tf.reduce_sum(-tf.log(sentence_top))
+        return pwieght*tf.reduce_sum(diff_top),sparse_loss     
+    def top_K_loss(self,sentence,image,K=50,margin=0.4):
         sim_matrix = tf.matmul(sentence, image, transpose_b=True)
         s_square = tf.reduce_sum(tf.square(sentence), axis=1)
         im_square = tf.reduce_sum(tf.square(image), axis=1)
@@ -137,79 +142,33 @@ class BidirectionNet:
             tf.summary.histogram(name=v.name+'_gradient', values=grads[i])
         return opt.apply_gradients(zip(grads,tvars))   
 
-    def train(self, sess, maxEpoch=300, lr=0.0001,is_load=False,ckpt_path=''):
-        logdir = './log/run_Bidirectionnet_GMM/'
-        model_save_path='./model/Bidirectionnet_lstm/'
-        make_if_not_exist(model_save_path)
-        model_save_path+='model'
-        data_root = '/media/ltp/40BC89ECBC89DD32/souhu_fusai/'
-        sentence = h5py.File(data_root+'train_sentence_fishervectors.h5',mode='r')
-        h5file = h5py.File(data_root+'train_img_feat_3crop_mean_all.h5', mode='r')
-        image_feat_all = h5file['feature']
-        train_op =self.build_trainop(self.total_loss,lr=lr,clipping_norm=100000)
-
-        summary_writer = tf.summary.FileWriter(logdir, sess.graph)
-        summary_op = tf.summary.merge_all()
-        N = image_feat_all.shape[0]
-        batch_idx = int(N / self.batch_size)
-        sess.run(tf.global_variables_initializer())
-        if is_load:
-            self.saver.restore(sess, ckpt_path)
-            print '%s loaded' %ckpt_path   
-            
-                
-
-
-        step =0
-        t0 = time.time()
-        for epoch in range(maxEpoch):
-            # shuffle
-            assert N==sentence.shape[0]
-            idxArr = np.random.permutation(N)
-            for idx in range(batch_idx):
-                interval = range(idx*self.batch_size , (idx+1)*self.batch_size)
-                raw_sentence = self.read_wordvector(sentence[idxArr[interval]],self.batch_size)
-                image_feat = image_feat_all[idxArr[interval]]
-                # sample
-                # train
-                feed_dict = {self.raw_sentence: raw_sentence, self.image_feat: image_feat}
-                _, summary, total_loss = sess.run([train_op, summary_op, self.total_loss], feed_dict=feed_dict)
-
-                if np.mod(step, 1) == 0:
-                    summary_writer.add_summary(summary, global_step=step)
-                if np.mod(step, 500) == 0:
-                    self.saver.save(sess, model_save_path, global_step=step)
-                if np.mod(step, 100) == 0:
-                    t = (time.time() - t0)/3600
-                    print '%.2f hours. Iteration %d. total loss = %.4f' %(t, step, total_loss)
-                step += 1
-
+    
     def train_multidataset(self, sess, maxEpoch=300, lr=0.0001,is_load=False,ckpt_path='',only_image = False):
-        logdir = './log/Bidirectionnet_GMM/GMM_ourword2vec/movemean_margin0.1/'
+        logdir = './log/Bidirectionnet_GMM/softmax_cluster/'
         print 'log in %s' %logdir
-        model_save_path = './model/Bidirectionnet_GMM/GMM_ourword2vec/movemean_margin0.1/'
+        model_save_path = './model/Bidirectionnet_GMM/softmax_cluster/'
         make_if_not_exist(model_save_path)
         model_save_path += 'model'
         data_root = '/media/ltp/40BC89ECBC89DD32/souhu_fusai/'
         img_feat_file = data_root + 'train_img_feat_3crop_mean_all.h5'
-        dataset_mean =np.load(data_root+'train_sentence_fishervectors_ourword2vec_mean.npy')
+        
         sentence_feat_file =data_root+'train_sentence_fishervectors_ourword2vec.h5'
+
         print 'image feature read from %s' %img_feat_file
         print 'sentence feature read from %s' %sentence_feat_file
-        print 'dataser mean is ',dataset_mean
         img_h5 = h5py.File(img_feat_file, 'r')
         sen_h5 = h5py.File(sentence_feat_file, 'r')
         L_im = img_h5['feature'].shape[0]
         L_sen = sen_h5['feature'].shape[0]
         assert L_im == L_sen
-        nDataset = 6
+        nDataset = 12
         dataset_size = int(L_im/nDataset)        
         step = 0
         train_op =self.build_trainop(self.total_loss,lr=lr,clipping_norm=500)
         summary_writer = tf.summary.FileWriter(logdir, sess.graph)
         summary_op = tf.summary.merge_all()
         sess.run(tf.global_variables_initializer())
-        
+    
         if is_load:
             self.saver.restore(sess, ckpt_path) #var_list=self.img_var
             print '%s loaded' %ckpt_path
@@ -231,13 +190,12 @@ class BidirectionNet:
                     img_feat_all = img_h5['feature'][shift:,:]
                     sentence = sen_h5['feature'][shift:,:]
                     N = img_feat_all.shape[0] 
-                print 'load dataset No%d  %d samples'%(setId,N)
                 for _ in range(1):
                     idxArr = np.random.permutation(N)
                     batch_idx = int(N / self.batch_size)
                     for idx in range(batch_idx):
                         interval = range(idx*self.batch_size , (idx+1)*self.batch_size)
-                        raw_sentence = sentence[idxArr[interval]]-dataset_mean
+                        raw_sentence = sentence[idxArr[interval]]
                         image_feat = img_feat_all[idxArr[interval]]
                         #lda_feat = lda[idxArr[interval]]
         
@@ -257,7 +215,7 @@ class BidirectionNet:
                             print '%.2f hours. Iteration %d. total loss = %.4f' %(t, step, total_loss)
                         step += 1         
 
-    def test_embed(self, sess, feat_file, model_path, scope, save_path, h5dataset='embed',mean_file=''):
+    def test_embed(self, sess, feat_file, model_path, scope, save_path, h5dataset='embed'):
         '''
         For testing. Generate the final embedding of images for image-text matching.
         Dataset: 'embed'
@@ -275,7 +233,7 @@ class BidirectionNet:
             input_tensor = self.raw_sentence
             h5file = h5py.File(feat_file, 'r')
             feat_all = np.array(h5file['feature'])
-            feat_all=feat_all-np.load(mean_file)
+    
         else:
             print 'invalid scope %s (must be either image or sentence)' %target_tensor.name
             sys.exit(1)   
@@ -338,25 +296,26 @@ if __name__ == '__main__':
     config.gpu_options.allow_growth=True
     with tf.Session(config=config) as sess:
         if is_train:
-            model = BidirectionNet(is_training=True,is_skip=False,is_TopKloss =True,batch_size=2000,is_keep_prob=True)
+            model = BidirectionNet(is_training=True,is_skip=False,is_TopKloss =False,batch_size=2000,is_keep_prob=False)
             #model.train(sess,lr=0.0001,is_load=True,ckpt_path='./model/Bidirectionnet_lstm/model-1500')
-            model.train_multidataset(sess,lr=0.0001)#,is_load=True,ckpt_path='./model/Bidirectionnet_GMM/GMM_30norm/model-5000')
+            model.train_multidataset(sess,lr=0.0001)
             #model.train(sess,lr=0.0001)
         else:
-            model = BidirectionNet(is_training=True,is_skip=False,is_TopKloss =True,batch_size=1000,is_keep_prob=False)
-            
-            feat_file = ['./test_img_feat_3crop_mean.h5','./test_sentence_fishervectors.h5']*2+['./test_img_feat_3crop_mean.h5','./test_sentence_fishervectors_ourword2vec.h5']
-           
-            model_path = ['./final_model/GMM1/model-29500']*2+['./final_model/GMM1_earlystop/model-16000']*2+['./final_model/ourword2vec_movemean/model-8500']*2
+            model = BidirectionNet(is_training=True,is_skip=False,is_TopKloss =False,batch_size=500,is_keep_prob=False)
+            #feat_file = '/media/ltp/40BC89ECBC89DD32/souhu_fusai/test_img_feat_3crop_mean.h5'
+            feat_file = './test_sentence_fishervectors_norm.h5'
+            #feat_file = './test_sentence_fishervectors_30norm.h5'
+            #feat_file = './fusai_news_end_info.npy'
+            #feat_file = './fusai_news_info.npy'
+            #feat_file = './val_img_feat_3crop_norm1.h5'
+            #feat_file = './clear_news_info.npy'
+            #feat_file ='./news_end_info.npy'
+            model_path = './model/Bidirectionnet_GMM/softmax_cluster/model-20000'
             scope = 'sentence'
-            scope=['image','sentence']*3
-            mean_file = ['./train_sentence_fishervectors_mean.npy']*4+['./train_sentence_fishervectors_ourword2vec_mean.npy']*2
-            save_path =['./emb/train_image_embed_GMM1_29500.h5','./emb/train_sentence_embed_GMM1_29500.h5',
-                        './emb/train_image_embed_GMM1_earlystop_16000.h5','./emb/train_sentence_embed_GMM1_earlystop_16000.h5',
-                './emb/train_image_embed_GMM_ourword2vec_movemean_8500.h5','./emb/train_sentence_embed_GMM_ourword2vec_movemean_8500.h5']
-            #save_path = './emb/train_sentence_embed_GMM_ourword2vec_movemean_34000.h5'
-            for v in range(len(feat_file)):            
-                model.test_embed(sess, feat_file[v], model_path[v], scope[v], save_path[v],mean_file=mean_file[v])	    
+            #scope='image'
+            #save_path ='./emb/train_image_embed_GMM_norm_margin0.1_50000.h5'
+            save_path = './emb/train_sentence_embed_GMM_softmax_cluster_20000.h5'
+            model.test_embed(sess, feat_file, model_path, scope, save_path)	    
 
 
 

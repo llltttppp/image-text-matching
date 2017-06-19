@@ -12,10 +12,11 @@ def make_if_not_exist(path):
         print 'folder %s created' %path
 class BidirectionNet:
     def __init__(self,is_training=True,is_keep_prob=False):
-        self.weight_decay = 0.0001
+        self.weight_decay = 0.00005
+        self.num_class=1000
         self.instance_list ={}
-        self.instance_list.update(zip([v.strip().split(' ')[0] for v in open('./vocabulary/instance_list.txt','r').readlines()],range(
-                                                                                                                                         5000)))
+        self.instance_list.update([(v.strip().split(' ')[0],int(v.strip().split(' ')[1])) for v in open('./vocabulary/keywords_labels.txt','r').readlines()])                               
+        self.cluster_idf = np.load('cluster_idf.npy')
         self.endpoint={}
         self.is_training = is_training
         self.keep_prob = 0.5 if is_keep_prob else 1.0
@@ -25,7 +26,7 @@ class BidirectionNet:
             self.build_summary()
     def build_input(self):
         # positive
-        self.labels = tf.placeholder(tf.float32, shape=[None,5000], name='concept_labels')
+        self.labels = tf.placeholder(tf.float32, shape=[None,self.num_class], name='concept_labels')
         self.image_feat = tf.placeholder(tf.float32,shape=[None,3,4096], name='image_features')   
     def conv_layer(self, X, num_output, kernel_size, s, p='SAME'):
         return tf.contrib.layers.conv2d(X,num_output,kernel_size,s,\
@@ -36,14 +37,21 @@ class BidirectionNet:
         with tf.variable_scope('image_net', reuse=reuse) as scope:
             wd = tf.contrib.layers.l2_regularizer(self.weight_decay)
             image_fc1 = tf.contrib.layers.fully_connected(image_feat,4096, weights_regularizer=wd,scope='i_fc1')
-            image_fc2 = tf.contrib.layers.fully_connected(image_fc1, 5000, activation_fn=tf.nn.sigmoid, weights_regularizer=wd, scope='i_fc2')
-            prob = 1-tf.reduce_prod(1-image_fc2,axis=1)
+            image_fc2 = tf.contrib.layers.fully_connected(image_fc1, self.num_class, activation_fn=None,weights_regularizer=wd, scope='i_fc2')
+            prob = tf.reduce_mean(image_fc2,axis=1)#1-tf.reduce_prod(1-image_fc2,axis=1)
         self.endpoint['image_fc1'] = image_fc1
         self.endpoint['image_fc2'] = image_fc2
         self.endpoint['prob'] = prob
         return prob
-    def mil_loss(self,prob,labels,elips=1e-4):        
-        cross_entropy = -tf.reduce_mean(labels*tf.log(prob+elips) + (1-labels)*tf.log(1-prob+elips))
+    def softmax_loss(self,image_fc,labels):
+        return tf.reduce_sum(tf.nn.softmax_cross_entropy_with_logits(labels=labels, 
+                                                      logits=image_fc))
+    def mil_loss(self,prob,labels,elips=1e-12,postive_weight=1.0):  
+        prob1 =prob
+        self.ploss=-tf.reduce_sum(labels*tf.log(prob1+elips))#/tf.reduce_sum(labels)
+        topk_neg=tf.nn.top_k(-(1-labels)*tf.log(1-prob1+elips),k=10)[0]
+        self.nloss=tf.reduce_sum(topk_neg)
+        cross_entropy = postive_weight*self.ploss+self.nloss
         return cross_entropy
     def triplet_loss(self, common, pos, neg, margin=0.2):
         # d(common, pos) + margin < d(common, neg)
@@ -56,11 +64,14 @@ class BidirectionNet:
         # compute loss
         if self.is_training:           
             self.reg_loss = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-            self.total_loss = tf.add_n([self.mil_loss(self.prob,self.labels)]+self.reg_loss)
-            self.saver = tf.train.Saver(max_to_keep=20)
+            self.total_loss = tf.add_n([self.softmax_loss(self.prob,self.labels)]+self.reg_loss)
+            #self.total_loss = tf.add_n([self.mil_loss(self.prob,self.labels)]+self.reg_loss)
+            self.saver = tf.train.Saver(max_to_keep=50)
     def build_summary(self):
         tf.summary.scalar('loss/reg_loss', tf.add_n(self.reg_loss))
-        tf.summary.scalar('loss/total_loss', self.total_loss)      
+        tf.summary.scalar('loss/total_loss', self.total_loss) 
+        #tf.summary.scalar('loss/ploss', self.ploss)
+        #tf.summary.scalar('loss/nloss', self.nloss)        
         for name, tensor in self.endpoint.items():
             tf.summary.histogram('activation/' + name, tensor)
         
@@ -68,18 +79,19 @@ class BidirectionNet:
         watch_list = ['i_fc1', 'i_fc2'] 
         for watch_scope in watch_list:
             watch_var = [var for var in t_var if watch_scope+'/weights' in var.name]
-            tf.summary.histogram('weights/'+watch_scope, watch_var[0])
-    def build_trainop(self,loss,lr=0.001,clipping_norm=10,optimizer =tf.train.AdadeltaOptimizer,tvars=None,clip_vars=None):
+            try:
+                tf.summary.histogram('weights/'+watch_scope, watch_var[0])
+            except:
+                pass
+    def build_trainop(self,loss,lr=0.001,clipping_norm=100,optimizer =tf.train.AdamOptimizer,tvars=None):
         if tvars is None:        
             tvars = tf.trainable_variables()
-        if clip_vars is None:
-            clip_vars = tvars
         g=tf.gradients(loss, tvars)
-        grads= [tf.clip_by_global_norm(v,clipping_norm) if v in clip_vars else v for v in g ]
+        grads= [tf.clip_by_norm(v,clipping_norm)  for v in g ]
         opt = optimizer(lr)
         for i,v in enumerate(tvars):
             tf.summary.histogram(name=v.name+'_gradient', values=grads[i])
-        return opt.apply_gradients(zip(grads,tvars))   
+        return opt.apply_gradients(zip(grads,tvars))    
     def positive_loss(self, x, y):
         return tf.reduce_sum(tf.squared_difference(x, y, name='positive_loss'))        
     def top_K_loss(self,sentence,image,K=30,margin=0.3):
@@ -108,21 +120,23 @@ class BidirectionNet:
         
         
         
-    def train(self, sess, maxEpoch=50, batch_size=600, lr=0.001,is_load=False, ckpt_path=''):
-        logdir = './log/mil'
+    def train(self, sess, maxEpoch=50, batch_size=2000, lr=0.001,is_load=False, ckpt_path=''):
+        logdir = './log/mil/keyword'
         print 'log in %s' %logdir
-        model_save_path='./model/mil/'
+        model_save_path='./model/mil/keyword/'
         make_if_not_exist(model_save_path)
         model_save_path += 'model'        
     
-        data_root = '../souhu_data/fusai/'
-        sentence = np.array([v.strip() for v in open(data_root+'train_txt/train.txt').readlines()])
+        data_root = '/media/ltp/40BC89ECBC89DD32/souhu_fusai/'
+        sentence_all = np.array([v.strip() for v in open('./train_txt/train.txt').readlines()])
         
-        img_feat_file = data_root + 'train_img_feat_3crop_notAvg.h5'
-        print 'image feature read from %s' %img_feat_file	
-        dataset_size = 249900        
+        img_feat_file = data_root + 'train_img_feat_3crop_notAvg_all.h5'
+        print 'image feature read from %s' %img_feat_file	     
         img_h5 = h5py.File(img_feat_file, 'r')
-        nDataset = len(img_h5.keys())
+        L_im = img_h5['feature'].shape[0]
+        nDataset = 6
+        dataset_size = int(L_im/nDataset)        
+        
         step = 0
         train_op=self.build_trainop(self.total_loss,lr=lr)
         summary_writer = tf.summary.FileWriter(logdir, sess.graph)
@@ -138,12 +152,17 @@ class BidirectionNet:
         for epoch in range(maxEpoch):
             for setId in np.random.permutation(nDataset):
                 shift = setId * dataset_size
-                img_feat_all=[]
-                img_feat_all = img_h5['feature_'+str(setId)][:,:,:]
-                N = img_feat_all.shape[0]
                 if setId < nDataset - 1:
+                    img_feat_all = img_h5['feature'][shift:shift+dataset_size,:]
+                    sentence = sentence_all[shift:shift+dataset_size]
+                    N = img_feat_all.shape[0]                     
                     assert N == dataset_size
-                for _ in range(10):
+                else: 
+                    img_feat_all = img_h5['feature'][shift:,:]
+                    sentence = sentence_all[shift:]
+                    N = img_feat_all.shape[0]   
+                print 'load No %d dataset'%setId
+                for _ in range(1):
                     idxArr = np.random.permutation(N)
                     batch_idx = int(N / batch_size)
                     for idx in range(batch_idx):
@@ -165,15 +184,19 @@ class BidirectionNet:
                             t = (time.time() - t0)/3600
                             print '%.2f hours. Iteration %d. total loss = %.4f' %(t, step, total_loss)
                         step += 1                   
-    def doc2vector(self,doc_list,batchsize = 100):
+    def doc2vector(self,doc_list,batchsize = 100,max_words=1):
         #ss=time.time()
-        labels =np.zeros((batchsize,len(self.instance_list)),dtype=np.float32)
+        labels =np.zeros((batchsize,self.num_class),dtype=np.float32)
+        count=0
         for i,v in enumerate(doc_list):
+            tmp_labels =np.zeros((self.num_class,),dtype = np.float32)
             for word in v.split(' '):
                 try:
-                    labels[i,self.instance_list[word]]=1
+                    tmp_labels[self.instance_list[word]]+=1*self.cluster_idf[self.instance_list[word]]
+                    count+=1
                 except:
                     pass
+            labels[i,np.argsort(-tmp_labels)[:max_words]]=1
        # print time.time()-ss
         return labels
             
@@ -221,24 +244,27 @@ class BidirectionNet:
         print 'embed done for scope %s. Saved shape ' %scope, embed.shape
 
 if __name__ == '__main__':
-    is_train = True
+    is_train = False
     config=tf.ConfigProto()
     config.gpu_options.allow_growth=True
     with tf.Session(config=config) as sess:
         model = BidirectionNet(is_training=is_train)
         if is_train:
-            model.train(sess,lr=0.0001,batch_size=100)
-            #model.train(sess,lr=0.0001,is_load=True,ckpt_path='./model/fixnetpcaTopK/model-4000')
+            #model.train(sess,lr=0.00,batch01,batch_size=2000)
+            model.train(sess,lr=0.0001,
+                        batch_size=1000)#,is_load=True,ckpt_path='./model/mil/model-78000')
         else:
             #feat_file = './train_img_feat.h5'
             #feat_file = './news_validate_info_sub1.npy'
-            feat_file = './clear_news_info.npy'
-            model_path = './model/fixnetpcaTopK/model-10000'
-            scope = 'sentence'
-            #scope='image'
-            #save_path = './emb/train_image_embed_11k.h5'
-            save_path = './emb/train_sentence_embed_pcaTopK1w.h5'
-            model.test_embed(sess, feat_file, model_path, scope, save_path,batch_size=149)
+            feat_file = './test_img_feat_3crop_notAvg.h5'
+            model_path = './model/mil/keyword/model-60000'
+            #scope = 'sentence'
+            scope='image'
+            save_path = './emb/train_image_embed_mil_softmax_60000.h5'
+            #save_path = './emb/train_sentence_embed_pcaTopK1w.h5'
+            model.test_embed(sess, feat_file, model_path, scope, save_path,batch_size=1000)
+            text = np.array([v.strip() for v in open('./test_txt/test.txt').readlines()])
+            np.save('./emb/train_sentence_labels.npy',model.doc2vector(doc_list=text, batchsize=len(text), max_words=3))
     
             
             

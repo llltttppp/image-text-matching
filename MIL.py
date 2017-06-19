@@ -69,7 +69,7 @@ class BidirectionNet:
         for watch_scope in watch_list:
             watch_var = [var for var in t_var if watch_scope+'/weights' in var.name]
             tf.summary.histogram('weights/'+watch_scope, watch_var[0])
-    def build_trainop(self,loss,lr=0.001,clipping_norm=10,optimizer =tf.train.AdadeltaOptimizer,tvars=None):
+    def build_trainop(self,loss,lr=0.001,clipping_norm=10,optimizer =tf.train.AdamOptimizer,tvars=None):
         if tvars is None:        
             tvars = tf.trainable_variables()
         g=tf.gradients(loss, tvars)
@@ -218,7 +218,7 @@ class BidirectionNet:
         print 'embed done for scope %s. Saved shape ' %scope, embed.shape
 
 if __name__ == '__main__':
-    is_train = True
+    is_train = False
     config=tf.ConfigProto()
     config.gpu_options.allow_growth=True
     with tf.Session(config=config) as sess:
@@ -227,15 +227,15 @@ if __name__ == '__main__':
             model.train(sess,lr=0.0001,batch_size=100)
             #model.train(sess,lr=0.0001,is_load=True,ckpt_path='./model/fixnetpcaTopK/model-4000')
         else:
-            #feat_file = './train_img_feat.h5'
+            feat_file = '/media/ltp/40BC89ECBC89DD32/souhu_fusai/test_img_feat_3crop_notAvg.h5'
             #feat_file = './news_validate_info_sub1.npy'
-            feat_file = './clear_news_info.npy'
-            model_path = './model/fixnetpcaTopK/model-10000'
-            scope = 'sentence'
-            #scope='image'
+            #feat_file = './clear_news_info.npy'
+            model_path = './model/mil/fencengci/model-3500'
+            #scope = 'sentence'
+            scope='image'
             #save_path = './emb/train_image_embed_11k.h5'
-            save_path = './emb/train_sentence_embed_pcaTopK1w.h5'
-            model.test_embed(sess, feat_file, model_path, scope, save_path,batch_size=149)
+            save_path = './emb/train_mil_embed_fencengci_5000.h5'
+            model.test_embed(sess, feat_file, model_path, scope, save_path,batch_size=200)
     
             
             
